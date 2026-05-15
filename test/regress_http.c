@@ -6081,6 +6081,182 @@ static void https_per_socket_bevcb_test(void *arg)
 #endif
 
 #ifdef EVENT__HAVE_MBEDTLS
+
+/* ---- regression tests for evhttp-null-guard-freed-conn.patch ----------- */
+
+/*
+ * Fix 1: null-guard freed-conn callbacks.
+ *
+ * When evhttp_connection_free() is called while BEV_OPT_DEFER_CALLBACKS has
+ * already queued a bufferevent callback, the cbarg is zeroed before the
+ * callback fires.  evhttp_write_cb/read_cb/error_cb all dereference evcon
+ * immediately, so they need a null-guard at entry.
+ *
+ * Scenario (mirrors the pantavisor crash, issue #1808): make a successful
+ * HTTPS request, then free the connection from inside the request callback.
+ * The SSL layer (especially in filter mode) can have deferred read/write/error
+ * callbacks still pending at that point.  Without the null-guard those
+ * dereference a freed evcon.
+ */
+static void
+https_mbedtls_null_guard_cb(struct evhttp_request *req, void *arg)
+{
+	/* evhttp_request_get_connection(req) would return NULL here because
+	 * evhttp_connection_done() zeroes req->evcon before calling this cb.
+	 * Use the arg instead, which we set to evcon directly. */
+	struct evhttp_connection *evcon = arg;
+	struct event_base *base = evhttp_connection_get_base(evcon);
+
+	/* Free the connection from within the callback.  Any pending deferred
+	 * bufferevent callbacks that fire afterwards must not dereference the
+	 * (now-freed) evcon — that is what the null-guard prevents. */
+	evhttp_connection_free(evcon);
+	test_ok = 1;
+	event_base_loopexit(base, NULL);
+}
+
+static void
+https_mbedtls_null_guard_freed_conn_impl(void *arg, int ssl_mask)
+{
+	struct basic_test_data *data = arg;
+	struct evhttp_connection *evcon = NULL;
+	struct evhttp_request *req = NULL;
+	struct bufferevent *bev;
+	struct http_server hs = { 0, ssl_mask, NULL };
+	struct evhttp *http = http_setup(&hs.port, data->base, ssl_mask);
+
+	exit_base = data->base;
+	test_ok = 0;
+
+	bev = create_bev(data->base, -1, ssl_mask, BEV_OPT_CLOSE_ON_FREE);
+	tt_assert(bev);
+	bufferevent_mbedtls_set_allow_dirty_shutdown(bev, 1);
+
+	evcon = evhttp_connection_base_bufferevent_new(
+		data->base, NULL, bev, "127.0.0.1", hs.port);
+	tt_assert(evcon);
+	evhttp_connection_set_local_address(evcon, "127.0.0.1");
+
+	req = evhttp_request_new(https_mbedtls_null_guard_cb, evcon);
+	tt_assert(req);
+	evhttp_add_header(evhttp_request_get_output_headers(req), "Host",
+		"127.0.0.1");
+	/* Connection: close forces need_close=true in evhttp_connection_done so
+	 * the connection is not kept alive after the callback returns, which
+	 * avoids a use-after-free from detectclose touching the freed evcon. */
+	evhttp_add_header(evhttp_request_get_output_headers(req), "Connection",
+		"close");
+
+	tt_int_op(evhttp_make_request(evcon, req, EVHTTP_REQ_GET, "/test"),
+		!=, -1);
+	evcon = NULL; /* freed by the callback */
+
+	event_base_dispatch(data->base);
+	tt_int_op(test_ok, ==, 1);
+
+	/* Drain any deferred SSL callbacks that were queued while evcon was
+	 * still alive but fire only now.  Without the null-guard in
+	 * evhttp_read/write/error_cb these would dereference NULL and crash. */
+	event_base_loop(data->base, EVLOOP_NONBLOCK);
+
+end:
+	if (evcon)
+		evhttp_connection_free(evcon);
+	evhttp_free(http);
+}
+
+static void
+https_mbedtls_null_guard_freed_conn_test(void *arg)
+{ https_mbedtls_null_guard_freed_conn_impl(arg, HTTP_MBEDTLS); }
+
+static void
+https_mbedtls_filter_null_guard_freed_conn_test(void *arg)
+{ https_mbedtls_null_guard_freed_conn_impl(arg, HTTP_MBEDTLS | HTTP_SSL_FILTER); }
+
+/*
+ * Fix 2: demote replacefd assert.
+ *
+ * evhttp_connection_reset_hard_() calls bufferevent_replacefd(bev, -1) to
+ * detach the fd before reconnecting.  For SSL bufferevents this call can
+ * return an error (e.g. OpenSSL filter bevs where BIO_new_bufferevent fails).
+ * The old EVUTIL_ASSERT(!err && "setfd") aborted the process.  The fix
+ * demotes it to event_debug() so the process survives.
+ *
+ * Scenario: connect to a closed port so the TCP connect fails immediately,
+ * which drives evhttp_connection_cb_cleanup -> evhttp_connection_reset_(hard=1)
+ * -> evhttp_connection_reset_hard_() -> bufferevent_replacefd(bev, -1).
+ * If replacefd returns non-zero the old assert fires; the new code logs and
+ * continues.  With TT_FORK, SIGABRT would show up as a test failure.
+ *
+ * Note: req may be NULL (connection-failed path) or non-NULL (cleanup path)
+ * depending on the bufferevent type; the callback only exits the loop.
+ */
+static void
+https_mbedtls_conn_reset_hard_done(struct evhttp_request *req, void *arg)
+{
+	(void)req;
+	event_base_loopexit(arg, NULL);
+}
+
+static void
+https_mbedtls_conn_reset_hard_impl(void *arg, int ssl_mask)
+{
+	struct basic_test_data *data = arg;
+	struct evhttp_connection *evcon = NULL;
+	struct evhttp_request *req = NULL;
+	struct bufferevent *bev;
+	ev_uint16_t port = 0;
+	struct evhttp *http = http_setup(&port, data->base, ssl_mask);
+
+	exit_base = data->base;
+	test_ok = 0;
+
+	/* Free the server so nothing is listening on that port any more. */
+	evhttp_free(http);
+	http = NULL;
+
+	bev = create_bev(data->base, -1, ssl_mask, BEV_OPT_CLOSE_ON_FREE);
+	tt_assert(bev);
+	bufferevent_mbedtls_set_allow_dirty_shutdown(bev, 1);
+
+	/* Connecting to a closed port triggers ECONNREFUSED, which drives the
+	 * evhttp_connection_cb -> cleanup -> evhttp_connection_reset_(hard=1)
+	 * path that calls bufferevent_replacefd(bev, -1). */
+	evcon = evhttp_connection_base_bufferevent_new(
+		data->base, NULL, bev, "127.0.0.1", port);
+	tt_assert(evcon);
+	evhttp_connection_set_local_address(evcon, "127.0.0.1");
+	evhttp_connection_set_timeout(evcon, 1);
+
+	req = evhttp_request_new(https_mbedtls_conn_reset_hard_done, data->base);
+	tt_assert(req);
+	evhttp_add_header(evhttp_request_get_output_headers(req), "Host",
+		"127.0.0.1");
+
+	tt_int_op(evhttp_make_request(evcon, req, EVHTTP_REQ_GET, "/"), !=, -1);
+
+	event_base_dispatch(data->base);
+
+	/* Reaching here without SIGABRT means the replacefd assert was not
+	 * hit (or was demoted to a debug log). */
+	test_ok = 1;
+
+end:
+	if (evcon)
+		evhttp_connection_free(evcon);
+	tt_int_op(test_ok, ==, 1);
+}
+
+static void
+https_mbedtls_conn_reset_hard_test(void *arg)
+{ https_mbedtls_conn_reset_hard_impl(arg, HTTP_MBEDTLS); }
+
+static void
+https_mbedtls_filter_conn_reset_hard_test(void *arg)
+{ https_mbedtls_conn_reset_hard_impl(arg, HTTP_MBEDTLS | HTTP_SSL_FILTER); }
+
+/* ----------------------------------------------------------------------- */
+
 static void https_mbedtls_basic_test(void *arg)
 { http_basic_test_impl(arg, HTTP_MBEDTLS, "GET /test HTTP/1.1"); }
 static void https_mbedtls_filter_basic_test(void *arg)
@@ -6266,6 +6442,19 @@ struct testcase_t http_testcases[] = {
 	HTTPS_MBEDTLS(connection),
 	HTTPS_MBEDTLS(persist_connection),
 	HTTPS_MBEDTLS(per_socket_bevcb),
+	/* regression tests for evhttp-null-guard-freed-conn.patch */
+	{ "https_mbedtls_null_guard_freed_conn",
+	  https_mbedtls_null_guard_freed_conn_test,
+	  TT_ISOLATED|TT_FORK, &mbedtls_setup, NULL },
+	{ "https_mbedtls_filter_null_guard_freed_conn",
+	  https_mbedtls_filter_null_guard_freed_conn_test,
+	  TT_ISOLATED|TT_FORK, &mbedtls_setup, NULL },
+	{ "https_mbedtls_conn_reset_hard",
+	  https_mbedtls_conn_reset_hard_test,
+	  TT_ISOLATED|TT_FORK, &mbedtls_setup, NULL },
+	{ "https_mbedtls_filter_conn_reset_hard",
+	  https_mbedtls_filter_conn_reset_hard_test,
+	  TT_ISOLATED|TT_FORK, &mbedtls_setup, NULL },
 #endif
 
 	END_OF_TESTCASES
