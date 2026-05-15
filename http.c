@@ -911,6 +911,8 @@ static void
 evhttp_write_cb(struct bufferevent *bufev, void *arg)
 {
 	struct evhttp_connection *evcon = arg;
+	if (!evcon)
+		return;
 
 	/* Activate our call back */
 	if (evcon->cb != NULL)
@@ -1250,7 +1252,11 @@ static void
 evhttp_read_cb(struct bufferevent *bufev, void *arg)
 {
 	struct evhttp_connection *evcon = arg;
-	struct evhttp_request *req = TAILQ_FIRST(&evcon->requests);
+	struct evhttp_request *req;
+
+	if (!evcon)
+		return;
+	req = TAILQ_FIRST(&evcon->requests);
 
 	/* Cancel if it's pending. */
 	event_deferred_cb_cancel_(get_deferred_queue(evcon),
@@ -1466,7 +1472,9 @@ evhttp_connection_reset_hard_(struct evhttp_connection *evcon)
 
 	/** FIXME: manipulating with fd is unwanted */
 	err = bufferevent_replacefd(evcon->bufev, -1);
-	EVUTIL_ASSERT(!err && "setfd");
+	if (err)
+		event_debug(
+			("%s: bufferevent_replacefd failed (SSL bufferevent?)", __func__));
 
 	/* we need to clean up any buffered data */
 	tmp = bufferevent_get_output(evcon->bufev);
@@ -1610,7 +1618,11 @@ static void
 evhttp_error_cb(struct bufferevent *bufev, short what, void *arg)
 {
 	struct evhttp_connection *evcon = arg;
-	struct evhttp_request *req = TAILQ_FIRST(&evcon->requests);
+	struct evhttp_request *req;
+
+	if (!evcon)
+		return;
+	req = TAILQ_FIRST(&evcon->requests);
 
 	switch (evcon->state) {
 	case EVCON_CONNECTING:
